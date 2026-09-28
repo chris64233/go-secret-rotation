@@ -14,6 +14,9 @@ const (
 	VersionGrace VersionStatus = "grace"
 	// VersionRetired 宽限期结束，版本彻底失效。
 	VersionRetired VersionStatus = "retired"
+	// VersionRevoked 版本因疑似泄露被紧急撤销：立即停止向任何新读取提供，
+	// 且为终态，永远不能再次激活或被选为回退目标。
+	VersionRevoked VersionStatus = "revoked"
 )
 
 // RotationStatus 描述一次轮换流程的状态机。
@@ -78,12 +81,30 @@ type AcknowledgeInput struct {
 	RequestID     string
 }
 
+// RevokeInput 紧急撤销一个疑似泄露的版本。
+type RevokeInput struct {
+	KeyName string
+	// Version 要撤销的版本号，必须 > 0。
+	Version int
+	// Reason 为只含非敏感元数据的撤销原因，会进入审计与撤销记录，
+	// 严禁写入密钥材料。
+	Reason string
+	// Actor 为执行撤销的主体，用于审计；可为空。
+	Actor string
+	// RequestID 用于撤销动作的幂等去重（同一密钥下相同 RequestID
+	// 必须指向同一次撤销）。
+	RequestID string
+}
+
 // SecretView 是受控读取返回的敏感载荷。
 type SecretView struct {
 	KeyName       string
 	Version       int
 	Plaintext     []byte
 	VersionStatus VersionStatus
+	// Fallback 为 true 表示当前版本已被撤销，本次返回的是撤销时选定的
+	// 历史安全版本（临时接替），其一旦宽限期到期，读取将明确失败。
+	Fallback bool
 }
 
 // VersionInfo 状态查询用的版本元数据（不含任何密钥材料）。
@@ -118,10 +139,20 @@ type KeyState struct {
 	Rotations   []*rotationState
 	// ActiveVersion 为 0 表示尚无激活版本。
 	ActiveVersion int
+	// ServingVersion 是当前“读当前版本”实际服务的版本指针：
+	// 正常情况下等于 ActiveVersion；当前 active 版本被撤销后，它可能临时
+	// 指向撤销时选定的历史安全版本（处于 grace 宽限期内）。为 0 表示当前
+	// 没有任何可服务版本，读当前版本必须明确失败，服务层不得自行切换到
+	// 其他历史版本。
+	ServingVersion int
 	// PendingRotation 非空表示当前存在未终结的轮换。
 	PendingRotation string
 	// KeyRequests 记录密钥级动作幂等键：发起轮换 RequestID -> 轮换 ID。
 	KeyRequests map[string]string
+	// RevocationRequests 记录撤销动作幂等键：RequestID -> 撤销记录 ID。
+	RevocationRequests map[string]string
+	// Revocations 为该密钥全部紧急撤销记录（只含元数据）。
+	Revocations []*revocationState
 	// Revision 是存储层的乐观锁版本号，服务层不解释其含义。
 	Revision int64
 }
@@ -135,6 +166,18 @@ type versionState struct {
 	CreatedAt   time.Time
 	ActivatedAt time.Time
 	RetireAt    time.Time
+}
+
+// revocationState 是紧急撤销的内部持久化形态（只含元数据，不含密钥材料）。
+type revocationState struct {
+	ID              string
+	Version         int
+	Reason          string
+	Actor           string
+	CreatedAt       time.Time
+	FallbackVersion int
+	// Requests 记录本次撤销使用过的请求号，用于动作级幂等。
+	Requests map[string]string
 }
 
 // rotationState 是轮换的内部持久化形态。

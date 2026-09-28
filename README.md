@@ -3,7 +3,9 @@
 需要多个消费者确认的应用密钥轮换编排服务（Go 库）。密钥按**不可变版本**
 管理；每次轮换先建立“待激活”新版本并**冻结**本次必须确认的消费者集合，
 达到确认门槛后新版本才能原子激活，旧版本同时进入只读宽限期，宽限期结束
-后旧版本读取必然失败。
+后旧版本读取必然失败。当**当前版本疑似泄露**时，可紧急撤销：立即阻止新
+读取，自动回退到最近一个仍安全且未过期的历史版本临时接替；没有合适版本
+时读取明确失败，绝不悄悄切换到任意旧值。
 
 开发环境：Go 1.23.0，无第三方依赖。
 
@@ -13,14 +15,18 @@
 
 ```
 pending ──(轮换激活)──► active ──(被更新版本取代)──► grace ──(宽限期结束)──► retired
-   │                       ▲                              ▲
-   └─(轮换取消/超时)─► retired                           读取时原子退役
+   │                       │  ▲                        │
+   └─(轮换取消/超时)─► retired                       读取时原子退役
+                           │  │
+                           └──┴──(紧急撤销)──► revoked（终态，永不激活）
 ```
 
 - 版本号单调递增、内容不可变：新版本只能通过轮换产生，任何状态迁移都不
   修改版本承载的密钥材料。
 - `pending` 版本不可读；`active` 全局唯一；`grace` 旧版本只读且有明确的
   `RetireAt` 时刻；`retired` 后读取一律返回 `expired`。
+- `revoked` 表示版本因疑似泄露被紧急撤销：立即停止向任何**新读取**提供，
+  为终态——永远不能再次激活、不能进入宽限期、也不能被选为回退目标。
 - 密钥未配置宽限期（`GracePeriod == 0`）时，旧版本在新版本激活的同一刻
   立即退役。
 
@@ -38,6 +44,26 @@ pending ─────────├──► cancelled（待激活版本废�
 - 发起轮换时冻结 `RequiredConsumers` 快照与超时截止时刻；之后消费者
   目录如何变化都不改变本次门槛。
 
+### 紧急撤销与安全回退
+
+每个密钥除 `ActiveVersion` 外还维护一个**服务指针** `ServingVersion`：
+
+- 正常情况下服务指针等于 `ActiveVersion`，`ReadSecret(..., 0, ...)`
+  返回当前激活版本。
+- 调用 `Revoke` 撤销当前版本时，版本立即进入终态 `revoked`，服务在同一
+  个原子 CAS 中从**仍处于 grace 宽限期内**的历史版本里挑出版本号最大的
+  一个作为临时接替（`ServingVersion` 钉住它）。读取返回该版本且
+  `SecretView.Fallback == true`，调用方据此知道正在使用应急替代值。
+- 若没有任何仍安全且未过期的历史版本（无宽限期、全部已退役或已撤销），
+  服务指针置空，读当前版本返回 `revoked` **明确失败**——服务不会自行
+  挑选任何其他旧值。
+- 接替版本随后宽限期到期（读取/状态查询时原子退役）或本身被撤销时，
+  服务指针清空、停止提供秘密，同样**不会自行再换到其他版本**；恢复
+  服务的唯一方式是完成一次正常轮换、激活全新安全版本。
+- 撤销与读取并发时由 CAS 快照线性化：一次读取只能返回“撤销提交前确认
+  的安全版本”或撤销后状态允许的结果，撤销提交后任何新读取都不可能再
+  拿到被撤销版本。
+
 ## 使用方式
 
 ```go
@@ -45,7 +71,9 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
+    "strconv"
     "time"
 
     sr "github.com/chris64233/go-secret-rotation"
@@ -109,11 +137,38 @@ func main() {
     }
 
     // 受控读取（唯一返回明文的通道）。
-    view, err := svc.ReadSecret(ctx, "payments-db", 0, "billing") // version<=0 表示当前 active
+    view, err := svc.ReadSecret(ctx, "payments-db", 0, "billing") // version<=0 表示当前服务版本
     if err != nil {
         panic(err)
     }
-    fmt.Println("active version:", view.Version)
+    fmt.Println("active version:", view.Version, "fallback:", view.Fallback)
+
+    // 紧急场景：怀疑当前版本泄露，立即撤销。服务自动回退到最近一个仍在
+    // 宽限期内的历史版本临时接替；没有合适版本时后续读取明确失败。
+    rec, err := svc.Revoke(ctx, sr.RevokeInput{
+        KeyName:   "payments-db",
+        Version:   view.Version,
+        Reason:    "suspected leak in CI logs",
+        Actor:     "oncall",
+        RequestID: "req-revoke-0001",
+    })
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println("revoked v"+strconv.Itoa(rec.Version), "fallback ->", rec.FallbackVersion)
+
+    // 撤销后读当前版本：有接替版本则拿到历史安全版本（Fallback=true），
+    // 否则得到 *sr.Error（Code=revoked），必须走告警/熔断，
+    // 而不是假定系统会自动挑一个旧值。
+    if v, err := svc.ReadSecret(ctx, "payments-db", 0, "billing"); err != nil {
+        var se *sr.Error
+        if errors.As(err, &se) && se.Code == sr.CodeRevoked {
+            // 无可用安全版本：触发告警并尽快完成新轮换。
+            fmt.Println("secret serving halted, rotate now")
+        }
+    } else {
+        fmt.Println("serving fallback v" + strconv.Itoa(v.Version))
+    }
 
     // 状态查询只返回元数据，不含任何密钥材料。
     info, _ := svc.Status(ctx, "payments-db")
@@ -134,9 +189,10 @@ func main() {
 | `Acknowledge` | 消费者确认已加载待激活版本；按“消费者 + 轮换”幂等 |
 | `Activate` | 门槛达成后原子激活新版本，旧版本同时进入宽限期（或立即退役） |
 | `Cancel` | 取消未终结轮换并废弃 pending 版本；终态后迟到取消被拒绝 |
+| `Revoke` | 紧急撤销 active/grace 版本并原子选定历史安全版本接替；无安全版本时停止服务 |
 | `ProcessTimeout` / `SweepTimeouts` | 终结超过截止时间的轮换 |
-| `ReadSecret` | 唯一返回明文的受控读取通道，带读者白名单、版本与宽限期校验 |
-| `Status` | 查询全部版本/轮换的非敏感状态；顺带应用到期的超时与退役 |
+| `ReadSecret` | 唯一返回明文的受控读取通道，带读者白名单、版本与宽限期/撤销校验 |
+| `Status` | 查询全部版本/轮换/撤销的非敏感状态；顺带应用到期的超时与退役 |
 
 ## 幂等与冲突规则
 
@@ -150,6 +206,12 @@ func main() {
   - 声明加载的版本号与待激活版本不一致 → `invalid_argument`；
   - 轮换终态后的迟到确认 → `failed_precondition`，不推进任何状态。
 - **激活/取消**：重复调用天然幂等；请求号被不同动作复用返回 `conflict`。
+- **紧急撤销**：
+  - 同一版本重复撤销天然幂等，返回既有撤销记录，不重复落审计；
+  - 相同 `RequestID` 重放返回同一条记录；同请求号用于撤销**不同版本**
+    返回 `conflict`；
+  - 撤销状态（版本置 `revoked`、服务指针）与撤销记录在**同一个 CAS**
+    中原子保存，不会出现“版本已撤销但记录缺失”或反之的中间态。
 
 ## 并发与终态保证
 
@@ -160,7 +222,11 @@ func main() {
 - 轮换只会进入**恰好一个**终态，终态迁移审计事件恰好一条；
 - 激活后迟到取消返回 `failed_precondition`，`active` 版本不回退；
 - 宽限期到期在读取路径中以“先原子退役落库、再返回过期错误”的方式处理，
-  保证此后任何读取都失败。
+  保证此后任何读取都失败；
+- 紧急撤销与读取并发时，撤销在单个 CAS 中原子生效：CAS 提交前已开始的
+  读取可能仍返回旧的安全版本，提交后的所有新读取都不可能拿到被撤销
+  版本，只能返回钉住的接替版本或明确失败。接替版本到期/被撤销同样以
+  原子状态迁移停止服务，系统不会自行跳到其他版本。
 
 ## 错误分类
 
@@ -173,9 +239,10 @@ func main() {
 | `not_found` | 密钥、版本或轮换不存在 |
 | `already_exists` | 同名密钥重复创建 |
 | `conflict` | 请求号被不同内容/不同动作复用 |
-| `failed_precondition` | 门槛未达成即激活、对终态轮换迟到取消/确认、读取 pending 版本 |
+| `failed_precondition` | 门槛未达成即激活、对终态轮换迟到取消/确认、读取 pending 版本、撤销 pending/retired 版本 |
 | `permission_denied` | 非快照成员确认、非白名单消费者读取 |
-| `expired` | 版本已退役/宽限期结束、轮换已超时 |
+| `expired` | 版本已退役/宽限期结束（含临时接替版本到期）、轮换已超时 |
+| `revoked` | 版本被紧急撤销，或当前版本已撤销且无可用接替版本/接替版本已失效 |
 | `internal` | 加解密或持久化失败（详情不含密钥材料） |
 
 ## 机密性保证
@@ -186,7 +253,8 @@ func main() {
   “密钥名 + 版本号”作为 GCM 附加数据，防止密文跨密钥/跨版本搬运。
   `MemoryStore` 仅用于单机/测试，生产环境需实现自己的持久化 `Store`。
 - 审计事件（`AuditSink`）与全部错误消息只含密钥名、版本号、消费者等
-  元数据，禁止出现明文或密文片段。测试以明文探针扫描持久化状态、
+  元数据，禁止出现明文或密文片段。紧急撤销记录（原因、操作者、接替
+  版本号）同样只含元数据。测试以明文探针扫描持久化状态、
   审计事件和错误文本来固化这一保证。
 
 ## 测试
@@ -199,4 +267,9 @@ go test -cover ./...     # 覆盖率
 
 测试覆盖：完整轮换生命周期、确认幂等与请求号冲突、快照冻结不随成员
 变化、激活/取消/超时三方并发只产生一个终态、宽限期到期读取必然失败、
-静态加密往返与防搬运、以及明文不泄漏到持久化/审计/错误文本。
+静态加密往返与防搬运、以及明文不泄漏到持久化/审计/错误文本。紧急撤销
+专项覆盖：撤销当前版本自动回退到最近安全 grace 版本、无安全版本时
+读取明确失败、被撤销版本永不被选为接替目标且永不复活、接替版本到期/
+被撤销即停止服务且不自行换版本、重复撤销与请求号双重幂等、撤销后
+正常轮换恢复服务、读/撤销并发线性化、以及撤销记录与状态原子保存且
+不含明文。

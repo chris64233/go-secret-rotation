@@ -23,6 +23,9 @@ const (
 	CodePermissionDenied Code = "permission_denied"
 	// CodeExpired 版本宽限期已结束或轮换已超时。
 	CodeExpired Code = "expired"
+	// CodeRevoked 版本因疑似泄露被紧急撤销，或当前版本已撤销且没有可服务
+	// 的临时接替版本（接替版本失效后同样返回此码）。
+	CodeRevoked Code = "revoked"
 	// CodeInternal 服务内部错误（持久化、加解密失败等），错误详情不会包含密钥明文。
 	CodeInternal Code = "internal"
 )

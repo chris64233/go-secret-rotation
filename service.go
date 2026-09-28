@@ -56,11 +56,13 @@ func (s *Service) CreateKeyVersion(ctx context.Context, in CreateKeyInput) (*Ver
 		return nil, newError(CodeInternal, op, "encrypt initial version failed")
 	}
 	st := &KeyState{
-		Name:          in.Name,
-		GracePeriod:   in.GracePeriod,
-		Readers:       sortedCopy(in.Readers),
-		ActiveVersion: 1,
-		KeyRequests:   map[string]string{},
+		Name:               in.Name,
+		GracePeriod:        in.GracePeriod,
+		Readers:            sortedCopy(in.Readers),
+		ActiveVersion:      1,
+		ServingVersion:     1,
+		KeyRequests:        map[string]string{},
+		RevocationRequests: map[string]string{},
 		Versions: []*versionState{{
 			Number:      1,
 			Status:      VersionActive,
@@ -263,7 +265,15 @@ func (s *Service) Activate(ctx context.Context, keyName, rotationID, requestID s
 		newV.Status = VersionActive
 		newV.ActivatedAt = now
 		if old := findVersion(st, st.ActiveVersion); old != nil && old.Number != newV.Number {
-			if st.GracePeriod > 0 {
+			if old.Status != VersionActive {
+				// 旧 active 可能已被紧急撤销（revoked 为终态）：
+				// 绝不能用 grace/retired 覆盖撤销标记，让泄露版本“复活”。
+				events = append(events, AuditEvent{
+					Time: now, KeyName: keyName, RotationID: r.ID, Version: old.Number,
+					Action: "revoked_version_superseded",
+					Detail: "revoked version remains revoked after new activation",
+				})
+			} else if st.GracePeriod > 0 {
 				old.Status = VersionGrace
 				old.RetireAt = now.Add(st.GracePeriod)
 				events = append(events, AuditEvent{
@@ -282,6 +292,8 @@ func (s *Service) Activate(ctx context.Context, keyName, rotationID, requestID s
 			}
 		}
 		st.ActiveVersion = newV.Number
+		// 新版本经完整确认流程激活，是全新的安全版本，服务指针随之恢复。
+		st.ServingVersion = newV.Number
 		r.Status = RotationActivated
 		r.ActivatedAt = now
 		r.EndedAt = now
@@ -355,10 +367,17 @@ func (s *Service) Cancel(ctx context.Context, keyName, rotationID, requestID str
 
 // ReadSecret 是唯一会返回密钥明文的受控通道：
 //   - consumer 必须在读白名单内（未配置白名单时不限制）；
-//   - version<=0 读取当前 active 版本；显式版本号只允许读取 active，
-//     或尚在 grace 宽限期内的旧版本；pending 版本不可读；
-//   - 宽限期结束的旧版本在本次读取中原子转为 retired 并返回 CodeExpired，
-//     之后任何读取都失败。
+//   - version<=0 读取“当前服务版本”：正常时为 active；当前版本被紧急撤销
+//     后，仅返回撤销时选定并钉住的历史安全版本（SecretView.Fallback=true），
+//     没有接替版本或接替版本已失效时返回 CodeRevoked/CodeExpired 明确失败，
+//     绝不会自行切换到其他历史版本；
+//   - 显式版本号只允许读取 active，或尚在 grace 宽限期内的旧版本；
+//     pending 版本不可读；revoked 版本返回 CodeRevoked；
+//   - 宽限期结束的版本在本次读取中原子转为 retired 并返回 CodeExpired；
+//     若它正是临时接替版本，同时清空服务指针（停止提供秘密）。
+//
+// 与撤销并发时，CAS 快照使每次读取线性化：只能返回撤销前确认的安全版本
+// （在撤销提交前读到旧快照）或撤销后状态所允许的结果。
 //
 // 审计记录只含元数据，不含明文；错误消息同样不含明文或密文片段。
 func (s *Service) ReadSecret(ctx context.Context, keyName string, version int, consumer string) (*SecretView, error) {
@@ -372,46 +391,131 @@ func (s *Service) ReadSecret(ctx context.Context, keyName string, version int, c
 		if !readerAllowed(st.Readers, consumer) {
 			return nil, false, newError(CodePermissionDenied, op, "consumer is not allowed to read this key")
 		}
-		target := st.ActiveVersion
-		if version > 0 {
-			target = version
-		}
-		v := findVersion(st, target)
-		if v == nil {
-			return nil, false, newError(CodeNotFound, op, "version not found")
-		}
 		now := s.now()
+
+		// 显式版本读取：只校验该版本自身状态，不做任何隐式切换。
+		if version > 0 {
+			v := findVersion(st, version)
+			if v == nil {
+				return nil, false, newError(CodeNotFound, op, "version not found")
+			}
+			events, err := s.checkReadable(keyName, v, now, consumer)
+			if err != nil {
+				// 若刚退役的正是临时接替版本，同步停止服务并补一条审计。
+				if v.Status == VersionRetired && st.ServingVersion == v.Number {
+					st.ServingVersion = 0
+					events = append(events, AuditEvent{
+						Time: now, KeyName: keyName, Version: v.Number,
+						Action: "serving_halted", Actor: consumer,
+						Detail: "fallback version expired",
+					})
+				}
+				return events, len(events) > 0, err
+			}
+			out, evs, commit, err := s.serveVersion(ctx, op, keyName, v, now, consumer, false)
+			view = out
+			return evs, commit, err
+		}
+
+		// 读当前版本：只跟随服务指针。指针为 0 表示撤销后无版本可服务
+		// （或接替版本已失效），必须明确失败，绝不自行挑选其他版本。
+		if st.ServingVersion == 0 {
+			return nil, false, newError(CodeRevoked, op, "current version is revoked and no serving version is available")
+		}
+		v := findVersion(st, st.ServingVersion)
+		if v == nil {
+			// 理论上不可达：防御性地停止服务而不是猜测目标。
+			st.ServingVersion = 0
+			return auditEvents{{
+				Time: now, KeyName: keyName, Action: "serving_halted", Actor: consumer,
+				Detail: "serving pointer missing",
+			}}, true, newError(CodeRevoked, op, "serving version missing")
+		}
 		switch v.Status {
 		case VersionActive:
 		case VersionGrace:
 			if !v.RetireAt.IsZero() && !now.Before(v.RetireAt) {
-				// 宽限期结束：状态先落库为 retired，再把过期错误返回调用方，
-				// 保证“此后读取必须失败”。
+				// 临时接替版本宽限期结束：原子退役并清空服务指针，
+				// 停止提供秘密，不允许自行再换到其他版本。
 				v.Status = VersionRetired
-				return auditEvents{{
-					Time: now, KeyName: keyName, Version: v.Number, Action: "version_retired",
-					Actor: consumer, Detail: "grace period ended",
-				}}, true, newError(CodeExpired, op, "version grace period ended")
+				st.ServingVersion = 0
+				return auditEvents{
+					{
+						Time: now, KeyName: keyName, Version: v.Number, Action: "version_retired",
+						Actor: consumer, Detail: "fallback grace period ended",
+					},
+					{
+						Time: now, KeyName: keyName, Version: v.Number, Action: "serving_halted",
+						Actor: consumer, Detail: "fallback version expired",
+					},
+				}, true, newError(CodeExpired, op, "fallback version grace period ended")
 			}
-		case VersionPending:
-			return nil, false, newError(CodeFailedPrecondition, op, "version has not been activated")
+		case VersionRevoked:
+			// 接替版本本身也被撤销：停止服务。
+			st.ServingVersion = 0
+			return auditEvents{{
+				Time: now, KeyName: keyName, Version: v.Number, Action: "serving_halted",
+				Actor: consumer, Detail: "fallback version revoked",
+			}}, true, newError(CodeRevoked, op, "serving version revoked")
 		default:
-			return nil, false, newError(CodeExpired, op, "version is retired")
+			st.ServingVersion = 0
+			return auditEvents{{
+				Time: now, KeyName: keyName, Version: v.Number, Action: "serving_halted",
+				Actor: consumer, Detail: "serving version no longer usable",
+			}}, true, newError(CodeExpired, op, "serving version is retired")
 		}
-
-		plaintext, err := s.cipher.Decrypt(ctx, keyName, v.Number, v.Ciphertext)
-		if err != nil {
-			return nil, false, newError(CodeInternal, op, "decrypt version failed")
-		}
-		view = &SecretView{KeyName: keyName, Version: v.Number, Plaintext: plaintext, VersionStatus: v.Status}
-		return auditEvents{{
-			Time: now, KeyName: keyName, Version: v.Number, Action: "secret_read", Actor: consumer,
-		}}, false, nil
+		out, evs, commit, err := s.serveVersion(ctx, op, keyName, v, now, consumer, v.Number != st.ActiveVersion)
+		view = out
+		return evs, commit, err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return view, nil
+}
+
+func (s *Service) checkReadable(keyName string, v *versionState, now time.Time, consumer string) (auditEvents, error) {
+	switch v.Status {
+	case VersionActive, VersionGrace:
+		if v.Status == VersionGrace && !v.RetireAt.IsZero() && !now.Before(v.RetireAt) {
+			// 宽限期结束：状态先落库为 retired，再把过期错误返回调用方，
+			// 保证“此后读取必须失败”。
+			v.Status = VersionRetired
+			return auditEvents{{
+				Time: now, KeyName: keyName, Version: v.Number, Action: "version_retired",
+				Actor: consumer, Detail: "grace period ended",
+			}}, newError(CodeExpired, "ReadSecret", "version grace period ended")
+		}
+		return nil, nil
+	case VersionRevoked:
+		return nil, newError(CodeRevoked, "ReadSecret", "version has been revoked")
+	case VersionPending:
+		return nil, newError(CodeFailedPrecondition, "ReadSecret", "version has not been activated")
+	default:
+		return nil, newError(CodeExpired, "ReadSecret", "version is retired")
+	}
+}
+
+// serveVersion 解密并组装受控读取视图。fallback 表示这是“读当前版本”
+// 路径上撤销后选定的临时接替版本；显式版本读取恒为 false。
+// 解密失败按只读错误处理。
+func (s *Service) serveVersion(ctx context.Context, op, keyName string, v *versionState, now time.Time, consumer string, fallback bool) (*SecretView, auditEvents, bool, error) {
+	plaintext, err := s.cipher.Decrypt(ctx, keyName, v.Number, v.Ciphertext)
+	if err != nil {
+		return nil, nil, false, newError(CodeInternal, op, "decrypt version failed")
+	}
+	detail := ""
+	if fallback {
+		detail = "fallback=true"
+	}
+	out := &SecretView{
+		KeyName: keyName, Version: v.Number, Plaintext: plaintext,
+		VersionStatus: v.Status, Fallback: fallback,
+	}
+	return out, auditEvents{{
+		Time: now, KeyName: keyName, Version: v.Number, Action: "secret_read",
+		Actor: consumer, Detail: detail,
+	}}, false, nil
 }
 
 // ProcessTimeout 对指定密钥执行一次超时处理：若存在已过截止时间但仍
@@ -503,6 +607,14 @@ func (s *Service) Status(ctx context.Context, keyName string) (*KeyInfo, error) 
 					Time: now, KeyName: keyName, Version: v.Number,
 					Action: "version_retired", Detail: "grace period ended",
 				})
+				// 若到期的正是临时接替版本：停止提供秘密，不自行换版本。
+				if st.ServingVersion == v.Number {
+					st.ServingVersion = 0
+					events = append(events, AuditEvent{
+						Time: now, KeyName: keyName, Version: v.Number,
+						Action: "serving_halted", Detail: "fallback version expired",
+					})
+				}
 				mutated = true
 			}
 		}
@@ -569,9 +681,11 @@ type KeyInfo struct {
 	GracePeriod       time.Duration
 	Readers           []string
 	ActiveVersion     int
+	ServingVersion    int
 	PendingRotationID string
 	Versions          []VersionInfo
 	Rotations         []RotationInfo
+	Revocations       []RevocationInfo
 }
 
 func keyInfo(st *KeyState) *KeyInfo {
@@ -580,6 +694,7 @@ func keyInfo(st *KeyState) *KeyInfo {
 		GracePeriod:       st.GracePeriod,
 		Readers:           cloneStrings(st.Readers),
 		ActiveVersion:     st.ActiveVersion,
+		ServingVersion:    st.ServingVersion,
 		PendingRotationID: st.PendingRotation,
 	}
 	for _, v := range st.Versions {
@@ -587,6 +702,9 @@ func keyInfo(st *KeyState) *KeyInfo {
 	}
 	for _, r := range st.Rotations {
 		out.Rotations = append(out.Rotations, *rotationInfo(r))
+	}
+	for _, r := range st.Revocations {
+		out.Revocations = append(out.Revocations, *revocationInfo(r))
 	}
 	return out
 }
@@ -725,13 +843,15 @@ func cloneStrings(in []string) []string {
 
 func cloneKeyState(st *KeyState) *KeyState {
 	out := &KeyState{
-		Name:            st.Name,
-		GracePeriod:     st.GracePeriod,
-		Readers:         cloneStrings(st.Readers),
-		ActiveVersion:   st.ActiveVersion,
-		PendingRotation: st.PendingRotation,
-		Revision:        st.Revision,
-		KeyRequests:     map[string]string{},
+		Name:               st.Name,
+		GracePeriod:        st.GracePeriod,
+		Readers:            cloneStrings(st.Readers),
+		ActiveVersion:      st.ActiveVersion,
+		ServingVersion:     st.ServingVersion,
+		PendingRotation:    st.PendingRotation,
+		Revision:           st.Revision,
+		KeyRequests:        map[string]string{},
+		RevocationRequests: map[string]string{},
 	}
 	for _, v := range st.Versions {
 		cv := *v
@@ -758,6 +878,20 @@ func cloneKeyState(st *KeyState) *KeyState {
 	}
 	for k, v := range st.KeyRequests {
 		out.KeyRequests[k] = v
+	}
+	for _, r := range st.Revocations {
+		cr := &revocationState{
+			ID: r.ID, Version: r.Version, Reason: r.Reason, Actor: r.Actor,
+			CreatedAt: r.CreatedAt, FallbackVersion: r.FallbackVersion,
+			Requests: map[string]string{},
+		}
+		for k, v := range r.Requests {
+			cr.Requests[k] = v
+		}
+		out.Revocations = append(out.Revocations, cr)
+	}
+	for k, v := range st.RevocationRequests {
+		out.RevocationRequests[k] = v
 	}
 	return out
 }
