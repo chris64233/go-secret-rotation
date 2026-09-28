@@ -14,6 +14,9 @@ const (
 	VersionGrace VersionStatus = "grace"
 	// VersionRetired 宽限期结束，版本彻底失效。
 	VersionRetired VersionStatus = "retired"
+	// VersionRevoked 版本因疑似泄露被紧急撤销，永久失效：任何读取都被拒绝，
+	// 且不存在任何路径能让该版本再次激活。
+	VersionRevoked VersionStatus = "revoked"
 )
 
 // RotationStatus 描述一次轮换流程的状态机。
@@ -78,6 +81,40 @@ type AcknowledgeInput struct {
 	RequestID     string
 }
 
+// RevokeInput 紧急撤销一个疑似泄露的版本。
+type RevokeInput struct {
+	KeyName string
+	// Version 为要撤销的版本号，必须 > 0（不允许隐式撤销“当前版本”，
+	// 以避免在调用方状态过期时误伤其它版本）。
+	Version int
+	// Actor 为执行撤销的操作者/系统标识，仅进入审计记录。
+	Actor string
+	// Reason 为撤销原因，仅允许承载非敏感元数据，不得包含密钥明文。
+	Reason string
+	// FallbackToSafe 为 true 时，若撤销的是当前 active 版本，尝试让最近一个
+	// 仍处于 grace 宽限期且尚未到期的历史版本临时接替；找不到合适版本则
+	// fail-closed（active 置空，此后读取明确失败，绝不悄悄切换到任意旧值）。
+	FallbackToSafe bool
+	// RequestID 用于撤销动作的幂等去重：同一密钥下相同 RequestID 必须指向
+	// 同一次撤销。
+	RequestID string
+}
+
+// RevocationInfo 撤销动作完成后的非敏感结果。
+type RevocationInfo struct {
+	KeyName string
+	// RevokedVersion 被永久撤销的版本号。
+	RevokedVersion int
+	// RevokedAt 撤销生效时刻。
+	RevokedAt time.Time
+	// FallbackVersion 临时接替的安全历史版本号；0 表示没有接替版本
+	//（密钥进入 fail-closed，读取明确失败）。
+	FallbackVersion int
+	// AlreadyRevoked 为 true 表示本次调用是重复撤销的幂等返回，状态未被
+	// 再次改写。
+	AlreadyRevoked bool
+}
+
 // SecretView 是受控读取返回的敏感载荷。
 type SecretView struct {
 	KeyName       string
@@ -94,6 +131,8 @@ type VersionInfo struct {
 	ActivatedAt time.Time
 	// RetireAt 仅当状态为 grace 时有意义，表示宽限期结束时刻。
 	RetireAt time.Time
+	// RevokedAt 仅当状态为 revoked 时有意义，表示紧急撤销生效时刻。
+	RevokedAt time.Time
 }
 
 // RotationInfo 状态查询用的轮换元数据。
@@ -116,12 +155,18 @@ type KeyState struct {
 	Readers     []string
 	Versions    []*versionState
 	Rotations   []*rotationState
-	// ActiveVersion 为 0 表示尚无激活版本。
+	// ActiveVersion 为 0 表示尚无激活版本；撤销当前版本且无安全替代时，
+	// 该字段同样回到 0，表示密钥 fail-closed——读取必须明确失败，
+	// 服务不得自行切换到任何其它版本。
 	ActiveVersion int
 	// PendingRotation 非空表示当前存在未终结的轮换。
 	PendingRotation string
-	// KeyRequests 记录密钥级动作幂等键：发起轮换 RequestID -> 轮换 ID。
+	// KeyRequests 记录密钥级动作幂等键：发起轮换/撤销的 RequestID -> 动作描述。
 	KeyRequests map[string]string
+	// RevokeRequests 记录撤销动作幂等键：RequestID -> 被撤销的版本号。
+	RevokeRequests map[string]int
+	// Revocations 为该密钥全部撤销记录，与状态变更在同一次 CAS 内原子保存。
+	Revocations []*revocationState
 	// Revision 是存储层的乐观锁版本号，服务层不解释其含义。
 	Revision int64
 }
@@ -135,6 +180,8 @@ type versionState struct {
 	CreatedAt   time.Time
 	ActivatedAt time.Time
 	RetireAt    time.Time
+	// RevokedAt 仅当状态为 revoked 时有意义，记录撤销生效时刻。
+	RevokedAt time.Time
 }
 
 // rotationState 是轮换的内部持久化形态。
@@ -154,6 +201,29 @@ type rotationState struct {
 	// Requests 记录本次轮换生命周期内出现过的请求号（发起、取消），
 	// 用于动作级幂等。
 	Requests map[string]string
+}
+
+// revocationState 是一次紧急撤销的内部持久化形态，只承载非敏感元数据，
+// 绝不包含密钥明文或密文。
+type revocationState struct {
+	// RevokedVersion 被永久撤销的版本号。
+	RevokedVersion int
+	// FallbackVersion 临时接替的安全历史版本号；0 表示无替代（fail-closed）。
+	FallbackVersion int
+	Actor           string
+	Reason          string
+	RevokedAt       time.Time
+}
+
+// RevocationRecord 是状态查询用的一条撤销记录（不含任何密钥材料）。
+type RevocationRecord struct {
+	// RevokedVersion 被永久撤销的版本号。
+	RevokedVersion int
+	// FallbackVersion 当时临时接替的安全历史版本号；0 表示无替代（fail-closed）。
+	FallbackVersion int
+	Actor           string
+	Reason          string
+	RevokedAt       time.Time
 }
 
 // AuditEvent 描述一条与密钥/轮换相关的审计记录。
