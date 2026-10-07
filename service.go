@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,10 @@ type Service struct {
 	cipher Encryptor
 	audit  AuditSink
 	now    Clock
+	// auditIndex 记录审计号 -> 秘密标识的全局占用，保证同一审计号重放
+	// 返回原审计，而换一个秘密复用审计号返回冲突。仅在单进程内有效。
+	auditMu    sync.Mutex
+	auditIndex map[string]string
 }
 
 // NewService 构造轮换服务。audit 可为 nil（不写审计）；clock 为 nil 时
@@ -29,7 +34,7 @@ func NewService(store Store, enc Encryptor, audit AuditSink, clock Clock) *Servi
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{store: store, cipher: enc, audit: audit, now: clock}
+	return &Service{store: store, cipher: enc, audit: audit, now: clock, auditIndex: map[string]string{}}
 }
 
 // CreateKeyVersion 建立一个全新密钥及其首个不可变版本（版本号从 1 开始，
@@ -61,6 +66,9 @@ func (s *Service) CreateKeyVersion(ctx context.Context, in CreateKeyInput) (*Ver
 		Readers:       sortedCopy(in.Readers),
 		ActiveVersion: 1,
 		KeyRequests:   map[string]string{},
+		AuditRequests: map[string]string{},
+		Instances:     map[string]map[string]*instanceReportState{},
+		AuditReports:  map[string][]*instanceReportState{},
 		Versions: []*versionState{{
 			Number:      1,
 			Status:      VersionActive,
@@ -732,6 +740,9 @@ func cloneKeyState(st *KeyState) *KeyState {
 		PendingRotation: st.PendingRotation,
 		Revision:        st.Revision,
 		KeyRequests:     map[string]string{},
+		AuditRequests:   map[string]string{},
+		Instances:       map[string]map[string]*instanceReportState{},
+		AuditReports:    map[string][]*instanceReportState{},
 	}
 	for _, v := range st.Versions {
 		cv := *v
@@ -759,6 +770,65 @@ func cloneKeyState(st *KeyState) *KeyState {
 	for k, v := range st.KeyRequests {
 		out.KeyRequests[k] = v
 	}
+	for k, v := range st.AuditRequests {
+		out.AuditRequests[k] = v
+	}
+	for svc, insts := range st.Instances {
+		cp := map[string]*instanceReportState{}
+		for id, r := range insts {
+			cr := *r
+			cp[id] = &cr
+		}
+		out.Instances[svc] = cp
+	}
+	for svc, reps := range st.AuditReports {
+		cp := make([]*instanceReportState, len(reps))
+		for i, r := range reps {
+			cr := *r
+			cp[i] = &cr
+		}
+		out.AuditReports[svc] = cp
+	}
+	for _, a := range st.Audits {
+		out.Audits = append(out.Audits, cloneAuditState(a))
+	}
+	return out
+}
+
+func cloneAuditState(a *auditState) *auditState {
+	ca := &auditState{
+		ID:              a.ID,
+		Status:          a.Status,
+		Services:        cloneStrings(a.Services),
+		SafeVersion:     a.SafeVersion,
+		RevokedVersions: cloneInts(a.RevokedVersions),
+		StartedAt:       a.StartedAt,
+		Deadline:        a.Deadline,
+		ClosedAt:        a.ClosedAt,
+		FullyComplete:   a.FullyComplete,
+		Instances:       map[string]*auditInstanceState{},
+		Requests:        map[string]string{},
+	}
+	for k, v := range a.Instances {
+		cv := *v
+		ca.Instances[k] = &cv
+	}
+	for _, is := range a.Issues {
+		ci := *is
+		ca.Issues = append(ca.Issues, &ci)
+	}
+	for k, v := range a.Requests {
+		ca.Requests[k] = v
+	}
+	return ca
+}
+
+func cloneInts(in []int) []int {
+	if in == nil {
+		return nil
+	}
+	out := make([]int, len(in))
+	copy(out, in)
 	return out
 }
 
