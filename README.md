@@ -125,6 +125,63 @@ func main() {
 
 后台可周期性调用 `SweepTimeouts(ctx)` 自动终结超过截止时间的轮换。
 
+## 紧急撤销后的轮换审计
+
+紧急撤销/回退发布新的安全版本后，可以发起一次**轮换审计**，回答两个
+问题：哪些服务实例已经换到安全版本，哪些仍在使用被撤销版本。审计同样
+通过 `Service` 使用：
+
+```go
+// 1) 发起审计：固定秘密标识、服务清单、当前安全版本与截止时刻。
+aud, err := svc.StartAudit(ctx, sr.StartAuditInput{
+    KeyName:   "payments-db",
+    AuditID:   "audit-2026-10-07",
+    Services:  []string{"billing", "checkout"},
+    Deadline:  time.Now().Add(time.Hour),
+    RequestID: "req-audit-start-1",
+})
+
+// 2) 各服务实例回报当前实际版本（重部署的新实例用 Replaces 声明取代关系）。
+svc.ReportInstance(ctx, sr.ReportInstanceInput{
+    KeyName: "payments-db", AuditID: aud.AuditID,
+    Service: "billing", Instance: "billing-7d9f", Version: 2,
+})
+
+// 3) 截止时间之后结案；未到截止时刻或安全版本已被再次轮换推进都会被拒绝。
+result, err := svc.CloseAudit(ctx, sr.CloseAuditInput{
+    KeyName: "payments-db", AuditID: aud.AuditID, RequestID: "req-audit-close-1",
+})
+
+// 4) 按服务查看当前安全版本、被撤销版本、最近回报与仍未达标的实例。
+for _, sv := range result.ServicesView {
+    fmt.Println(sv.Name, "safe=v", sv.CurrentSafeVersion,
+        "revoked=", sv.RevokedVersions,
+        "complete=", len(sv.Complete), "incomplete=", len(sv.Incomplete))
+}
+```
+
+审计语义：
+
+- **发起即冻结**：安全版本取发起时的当前 `active` 版本，服务清单与截止
+  时刻一并冻结；审计开始后新出现的实例不会被预先算作“已完成”，必须凭
+  自己截止前的安全版本回报才能达标。
+- **交错判定**：服务回报、撤销与结案交错时，只有“截止前收到且版本等于
+  当前安全版本”的回报计入；旧版本回报不计入，未到截止时间不能提前
+  结案；结案时若安全版本已被后续轮换推进，结案被拒绝，需另开审计。
+- **重部署重新判断**：实例以“服务 + 实例 ID”为键，达标结论在查询/结案
+  时按最新回报**现算**，不持久化“已完成”标记。重部署产生的新实例即使
+  声明取代旧实例，也按它自己的实际版本判断，不沿用旧实例结论。
+- **结案即历史**：结案快照（达标/未达标清单）之后不可变。结案后再发现
+  仍运行被撤销版本的实例（`ReportInstance` 回报低于结案安全版本），
+  只会**追加**一条新的问题记录（`AuditInfo.Issues`）并发出
+  `audit_issue_found` 事件，绝不改写历史结案。
+- **幂等与冲突**：相同审计号重复请求返回原审计；审计号相同但秘密标识、
+  服务集合或截止时刻变化，或请求号被不同内容复用，均返回 `conflict`。
+  审计号与请求号在同一 `Service` 实例内跨密钥唯一。
+- **不保存明文**：审计记录、问题记录、审计事件与错误文本只包含秘密标识
+  （密钥名）、版本号、服务/实例等元数据，测试以明文探针扫描持久化状态
+  和审计事件固化这一保证。
+
 ## API 一览
 
 | 方法 | 说明 |
@@ -137,6 +194,10 @@ func main() {
 | `ProcessTimeout` / `SweepTimeouts` | 终结超过截止时间的轮换 |
 | `ReadSecret` | 唯一返回明文的受控读取通道，带读者白名单、版本与宽限期校验 |
 | `Status` | 查询全部版本/轮换的非敏感状态；顺带应用到期的超时与退役 |
+| `StartAudit` | 发起轮换审计，冻结秘密标识、服务清单、当前安全版本与截止时刻 |
+| `ReportInstance` | 上报服务实例当前实际版本（支持重部署取代声明）；结案后回报旧版本追加问题记录 |
+| `CloseAudit` | 截止后结案并快照达标/未达标结论；结论之后不可变 |
+| `GetAudit` | 按服务查看安全/撤销版本、最近回报与未达标实例及结案后问题记录 |
 
 ## 幂等与冲突规则
 
@@ -200,3 +261,9 @@ go test -cover ./...     # 覆盖率
 测试覆盖：完整轮换生命周期、确认幂等与请求号冲突、快照冻结不随成员
 变化、激活/取消/超时三方并发只产生一个终态、宽限期到期读取必然失败、
 静态加密往返与防搬运、以及明文不泄漏到持久化/审计/错误文本。
+轮换审计测试覆盖：发起快照冻结与新实例不预达标、回报/撤销/结案交错
+（仅当前安全版本计入、安全版本推进后拒绝结案）、重部署新实例按实际
+版本重新判断、截止后回报不达标、重复审计号返回原结果与参数/跨秘密
+冲突、回报请求号幂等与内容冲突、结案后发现旧版本只追加问题记录且不
+改写历史、并发回报与并发结案竞态（`-race`）、以及审计持久化/事件/
+错误文本的明文探针检查。

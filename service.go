@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,10 @@ type Service struct {
 	cipher Encryptor
 	audit  AuditSink
 	now    Clock
+	// auditIndex 保证审计号与审计请求号在“同一服务实例”范围内跨密钥唯一。
+	// 键为审计号或带前缀的请求号，值为密钥名。
+	auditMu    sync.Mutex
+	auditIndex map[string]string
 }
 
 // NewService 构造轮换服务。audit 可为 nil（不写审计）；clock 为 nil 时
@@ -29,7 +34,13 @@ func NewService(store Store, enc Encryptor, audit AuditSink, clock Clock) *Servi
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{store: store, cipher: enc, audit: audit, now: clock}
+	return &Service{
+		store:      store,
+		cipher:     enc,
+		audit:      audit,
+		now:        clock,
+		auditIndex: map[string]string{},
+	}
 }
 
 // CreateKeyVersion 建立一个全新密钥及其首个不可变版本（版本号从 1 开始，
@@ -758,6 +769,34 @@ func cloneKeyState(st *KeyState) *KeyState {
 	}
 	for k, v := range st.KeyRequests {
 		out.KeyRequests[k] = v
+	}
+	for _, a := range st.Audits {
+		ca := &auditState{
+			AuditID:           a.AuditID,
+			Status:            a.Status,
+			SafeVersion:       a.SafeVersion,
+			Services:          cloneStrings(a.Services),
+			Deadline:          a.Deadline,
+			CreatedAt:         a.CreatedAt,
+			ClosedAt:          a.ClosedAt,
+			ClosedSafeVersion: a.ClosedSafeVersion,
+			StartRequest:      a.StartRequest,
+			CloseRequest:      a.CloseRequest,
+			Instances:         map[string]*auditInstanceState{},
+			ReportRequests:    map[string]string{},
+		}
+		for k, v := range a.Instances {
+			cv := *v
+			ca.Instances[k] = &cv
+		}
+		for k, v := range a.ReportRequests {
+			ca.ReportRequests[k] = v
+		}
+		for _, is := range a.Issues {
+			ci := *is
+			ca.Issues = append(ca.Issues, &ci)
+		}
+		out.Audits = append(out.Audits, ca)
 	}
 	return out
 }

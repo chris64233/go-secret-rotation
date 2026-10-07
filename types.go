@@ -116,6 +116,9 @@ type KeyState struct {
 	Readers     []string
 	Versions    []*versionState
 	Rotations   []*rotationState
+	// Audits 为针对该密钥发起的轮换审计。审计记录只承载秘密标识、
+	// 版本号、服务/实例等元数据，严禁保存任何明文或密文材料。
+	Audits []*auditState
 	// ActiveVersion 为 0 表示尚无激活版本。
 	ActiveVersion int
 	// PendingRotation 非空表示当前存在未终结的轮换。
@@ -154,6 +157,58 @@ type rotationState struct {
 	// Requests 记录本次轮换生命周期内出现过的请求号（发起、取消），
 	// 用于动作级幂等。
 	Requests map[string]string
+}
+
+// auditState 是轮换审计的内部持久化形态。审计在发起时冻结秘密标识、
+// 必须达标的服务清单、安全版本与截止时刻；结案后结果不可变，结案之后
+// 发现的旧版本实例只能追加 issueRecords，绝不回写结案结论。
+type auditState struct {
+	// AuditID 为审计号，同一密钥下唯一；跨密钥的唯一性由服务层索引保证。
+	AuditID string
+	Status  AuditStatus
+	// SafeVersion 为发起时固定的“当前安全版本”。结案时若当前 active
+	// 已不是该版本，审计不能提前结案。
+	SafeVersion int
+	// Services 为发起时冻结的服务清单快照。
+	Services []string
+	// Deadline 为发起时固定的截止时刻；截止后才允许结案。
+	Deadline  time.Time
+	CreatedAt time.Time
+	// ClosedAt/ClosedSafeVersion 为结案时刻与结案时认定的安全版本；
+	// 未结案时为零值。
+	ClosedAt          time.Time
+	ClosedSafeVersion int
+	// Instances 记录每个实例截止前的最新有效回报；completed 等结论
+	// 一律在读取/结案时按回报实际版本现算，不沿用任何持久化的
+	// “已完成”标记，避免重部署后沿用过时结论。
+	Instances map[string]*auditInstanceState
+	// Issues 为结案之后发现旧版本实例时追加的问题记录，只增不改。
+	Issues []*auditIssue
+	// StartRequest 记录发起该审计的请求号，用于请求级幂等/冲突。
+	StartRequest string
+	// CloseRequest 记录结案动作使用的请求号。
+	CloseRequest string
+	// ReportRequests 记录回报请求号 -> 回报内容指纹。
+	ReportRequests map[string]string
+}
+
+// auditInstanceState 是单个实例在审计窗口内的最新回报快照。
+type auditInstanceState struct {
+	Service    string
+	Instance   string
+	Version    int
+	ReportedAt time.Time
+	// Replaces 为该实例重部署时所取代的旧实例 ID；为空表示未声明。
+	Replaces string
+}
+
+// auditIssue 是审计结案之后追加的问题记录。
+type auditIssue struct {
+	ID       string
+	Service  string
+	Instance string
+	Version  int
+	FoundAt  time.Time
 }
 
 // AuditEvent 描述一条与密钥/轮换相关的审计记录。
